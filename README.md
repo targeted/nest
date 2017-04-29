@@ -1,2 +1,2 @@
-# nest
-Point-to-point IP VPN tunnel for FreeBSD
+Product documentation is here:
+https://www.targeted.org/nest/

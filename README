@@ -1,0 +1,744 @@
+Nest 3.3 README, Apr. 2017, http://www.targeted.org/nest/
+
+-------------------------------------------------------------------------------
+Contents:
+-------------------------------------------------------------------------------
+
+* Introduction
+* Portability
+* Features
+  * Authentication/Integrity
+  * Encryption
+  * Replay protection
+  * Queueing/Compression
+  * ICMP stream                          (new in version 3)
+  * IP masquerading/NAT                  (new in version 3)
+* Running and command-line parameters
+* Usage
+  * Installation
+  * Key management
+  * Clock synchronization
+* Performance hints and tests
+* Packet level schema
+* Copyright
+
+-------------------------------------------------------------------------------
+Introduction:
+-------------------------------------------------------------------------------
+
+Nest is a point-to-point IP VPN tunnel. It securely connects two LANs over
+the insecure WAN.
+
+As a security product, Nest has its tradeoffs, but as far as I can judge is
+well suited to running secure enough VPNs.
+
+Nest has got its name so as to resemble nos-tun (8), which got me inspired.
+On the other hand Nest doesn't inherit any code from nos-tun.
+
+Please direct all your comments and/or suggestions to
+Dmitry Dvoinikov <dmitry@targeted.org>
+
+-------------------------------------------------------------------------------
+Portability:
+-------------------------------------------------------------------------------
+
+Nest currently compiles under FreeBSD only. Because of its advanced capability
+of tunneling VPN traffic through ICMP request/response stream it depends on the
+FreeBSD divert sockets facility backed with the ipfw packet filter. Tested on
+FreeBSD versions from 4 to 11, both 32- and 64-bit.
+
+-------------------------------------------------------------------------------
+Features:
+-------------------------------------------------------------------------------
+
+1. Authentication/Integrity:
+
+   Each VPN packet carries a 96-bit HMAC. The HMAC value is a xor downsampled
+   160-bit SHA1 hash of the original packet combined with authentication key,
+   which has to be pre-shared by both sides. The area being hashed covers all
+   of the VPN packet, except the HMAC field itself.
+
+2. Encryption:
+
+   Each VPN packet goes fully blowfish encrypted. The area being encrypted
+   covers all the packet, including the HMAC field. Only the IP header goes
+   plain. Encryption is done in cbc mode with zero iv and 160 bit keysize.
+   The first blocks contains the HMAC and a reasonably good nonce. The source
+   for the key material is a SHA1 hash of a specified secret file which has
+   to be pre-shared by both sides.
+
+3. Replay protection:
+
+   Replay protection is carried out on a packet level using two techiques
+   combined in a single routine. Each VPN packet carries a 64-bit sequence id
+   of the form [x][y] where [x] is a 32-bit epoch time on sender when the
+   packet was sent and [y] is a 32-bit packet counter also incremented by
+   sender. This counter starts with a random 32-bit value and is reset to a
+   random value every second. This adds about 30 bits of additional randomness
+   per one second worth worth of packets. Thus [x][y] makes a reasonably good
+   nonce. The receiver maintains a cyclical buffer of id's of recently received
+   packets. Every VPN packet that is received, is considered being replayed if
+
+   (1) the difference between its [x] and epoch time on receiver is greater
+       than the fixed window size, which is specified with -y command line
+       parameter OR
+   (2) its [x][y] id is recorded in the buffer of recently received id's OR
+   (3) its [x][y] id is less than the least id recorded in the buffer.
+
+   Otherwise the packet is considered not being replayed and its id is
+   recorded at the end of the buffer.
+
+   The first check implies that clocks on Nest-running peers must be kept
+   synchronized, albeit not very strictly. There are different ways of
+   achieving that and I describe that in details in "Usage".
+
+   On the other hand, if you run Nest with -y 0, the first check is skipped,
+   i.e. time portions of received packets' id's are not compared with the
+   machine time, but the buffer checks (2) and (3) are still performed.
+   Therefore with -y 0 you may not care to synchronize the clocks, but always
+   make sure you never adjust the time backwards on either Nest peers, because
+   the other side would consider all the further packets as being replayed
+   until the time ticks back forward past the buffer-recorded values. Changing
+   time backwards is always a bad idea, but if you absolutely have to do so,
+   send HUP signal to other side's Nest to clear its replay buffer. Also,
+   if you run Nest with -y 0, you will have to never shut it down, because
+   all the previous packets would become replayable, albeit for small amount
+   of time.
+
+4. Queueing/Compression:
+
+   All the packets that are about to go through the Nest VPN tunnel get
+   queued for the specified amount of time (in range of hundreds milliseconds)
+   then compressed in a bunch using zlib and the result makes a single VPN
+   packet. This helps reducing traffic if the VPN is being established over
+   an expensive high latency link by slightly increasing that latency. Both
+   queueing and compression can be independently configured and/or turned
+   off with -q and -z command-line parameters.
+
+   Note that Nest differentiates between certain types of packets, ex.
+   ICMP packets are sent immediately as they arrive, regular TCP and UDP
+   packets get queued, and small TCP and UDP packets cause the queue to be
+   flushed. This logic is encapsulated in nest.c::tun_packet_switch().
+
+5. ICMP stream (new in version 3):
+
+   VPN traffic travels through the WAN in a stream of IP packets. Nest uses
+   either
+
+   (1) plain IP packets (tagged with any user-specified protocol) OR
+   (2) conventional ICMP echo requests/responses
+
+   This means that VPN can be established not only when Nest running hosts have
+   full connectivity (first option), but also when one of the hosts can merely
+   ping the other (second option). Note, that the required ICMP stream is
+   unidirectional, i.e. the latter host may not be able to ping the former, but
+   only to respond to pings. This allows VPN traffic to go through any firewall
+   which lets ICMP echo requests out and responses in. Nest keeps ICMP requests
+   and responses statefully paired, therefore it can bypass a stateful packet
+   filter.
+
+6. IP masquerading (new in version 3):
+
+   Nest can modify the IP source and destination addresses on the packets it's
+   sending to the LAN, thus allowing for all sorts of tricks, see more in
+   "Usage" section. This is similar to what's done with NAT, but stateless, on
+   per-packet level.
+
+-------------------------------------------------------------------------------
+Running and command-line parameters:
+-------------------------------------------------------------------------------
+
+Nest is a daemon, it runs in background forever. It has to be run with root
+privileges, because only a privileged user may open a raw network socket.
+Sending HUP signal to Nest causes it to re-read the (updated) key file(s).
+If Nest wants to say something, it does so by calling to syslog, so check
+/var/log/messages.
+
+nest -s tunnel.entry.virtual.address  (can be dotted decimal or DNS names)
+     -d tunnel.exit.virtual.address
+     -m tunnel.netmask                optional, default = 255.255.255.252
+     -r this.peer.real.address
+     -g remote.peer.real.address
+     -t /dev/tunX
+     -k /pre/shared/secret/enc_key
+     -K /pre/shared/secret/auth_key   optional, default = same as enc_key
+     -P /path/pidfile                 optional, default = /var/run/nest.pid
+     -p ip_protocol_number            optional, default = 99 (ipip)
+     -e req|resp                      optional, may only be used with -p 1
+     -D divert_port_number            optional, must be used with -e resp
+     -n replace.source.ip.with        optional, default = not specified
+     -N replace.destination.ip.with   optional, default = not specified
+     -q queue_delay_in_milliseconds   optional, default = 100, range 0-1000
+     -z zlib_compression_level        optional, default = 6, range 0-9
+     -y replay_window_size_in_seconds optional, default = 60, range 0-3600
+     -M network_mtu_in_bytes          optional, default = 1500, rg 576-1500
+
+Parameters explained:
+
+-s, -d, -m:
+tunnel.entry.virtual.address, tunnel.exit.virtual.address and tunnel.netmask
+specify the parameters of a virtual network segment that the tunnel makes.
+Neither of the addresses should bear any resemblance whatsoever to any of the
+addresses already existing in your network. Pick a pair of virtual addresses
+that don't exist anywhere near in your network, ex. 10.0.0.1 and 10.0.0.2 and
+leave netmask at default.
+
+-r, -g:
+this.peer.real.address is a permanent static address of this machine on the
+interface connected to the outside world. remote.peer.real.address is the real
+address of the other side's Nest running machine. See details under
+"Usage/Installation".
+
+-t:
+/dev/tunX is any tunneling device, you can pick X at random, but make sure
+/dev/tunX exists and is not used by anyone else (ex. other Nest). You might
+need to MAKEDEV more devices.
+
+-k:
+/pre/shared/secret/enc_key is a path to an existing file containing raw key
+material used for encrypting the packets. The exact same copy of this file
+must exist at the other side for Nest to work.
+
+-K:
+/pre/shared/secret/auth_key is a path to an existing file containing raw key
+material used for authenticating the packets. The exact same copy of this
+file must exist at the other side for Nest to work.
+
+-P:
+/path/pidfile is a path to a pid file Nest writes its pid to.
+
+-p:
+ip_protocol_number is an IP protocol number from /etc/protocols to tag VPN
+packets with. If not 1 (protocol ICMP), the exact number of protocol makes no
+real difference to VPN operation. Pick any protocol that could make it between
+the hosts through all the routers and filters, and least suspicious to the
+adversaries. If 1 (protocol ICMP), you will also have to specify -e req or
+-e resp.
+
+-e:
+Specifies whether this Nest is pinging or is pinged when using ICMP pings
+(echo requests/responses) for establishing the VPN. Can only be used with -p 1.
+Nest running with -e req is sending out a ping at least once in a -q specified
+time (or more frequently, as necessary). Nest running with -e resp is sending
+out a pong only when necessary to send data. Note that without requests there
+could be no responses, therefore the Nest running with -e resp is explicitly
+dependent on the other side and can't send arbitrary fast stream of packets.
+If its packet queue overflows it starts dropping packets (and reports it
+to syslog). One other note about running Nest with -e resp is that in this
+mode Nest must be able to read incoming ICMP echo requests, which is not
+possible by default (kernel handles ICMP requests all by itself, not allowing
+anyone to mess with it). Therefore Nest requires certain support from kernel-
+supported packet filtering facility (ipfw in FreeBSD). You will need to also
+specify -D parameter in command line and add a certain ipfw rule as follows:
+
+resphost# nest ... -D N ...
+resphost# ipfw add M divert N icmp from reqhost to resphost in via if0 \
+          icmptype 8
+
+Where N is an arbitrary divert port number (ex. 40000), and M is the number
+of the ipfw rule where it fits to your particular set of rules.
+
+-D:
+Specifies the number of the divert port that Nest opens in -p 1 -e resp mode.
+It is that port you need to divert incoming ICMP requests to using ipfw or
+similar facility.
+
+-n, -N:
+Think about these switches as about NAT. Each time Nest is sending an IP packet
+inside the LAN, it replaces the packet's source IP with -n specified address,
+and destination IP with -N specified address. This allows all sorts of tricks,
+one is described in "Usage". Note that with this switches on Nest modifies the
+headers of IP packets it transfers and this can occasionally break the packets
+(if they contain checksums that are calculated over the IP header too). Nest
+can't verify and/or restore packet's validity for any IP-based protocol,
+therefore use these switches with caution. Nest only guarantees that TCP, UDP
+and ICMP packets go through altered correctly.
+
+-q:
+queue_delay_in_milliseconds specifies for how long the outgoing packets get
+buffered in an attempt to collect more of them, compress in a bunch and thus
+save traffic. See note above in "Queueing/Compression". If you don't care
+about saving traffic but aim to the low latency, specify -q 0. This way
+queuing is disabled, and packets are being compressed on individual basis.
+
+-z:
+zlib_compression_level is a number in range 0-9 and corresponds to the
+parameter to zlib's deflateInit call. Specify 0 for no compression, 9 for
+best compression or anywhere in between.
+
+-y:
+replay_window_size_in_seconds is a number of seconds that separates valid
+packets from packets that came too late (or are being replayed).  You can turn
+this check off by specifying -y 0, but it is a BAD idea. Also note, that even
+with -y 0 replay check is still partially performed. See "Replay protection"
+section above. 
+
+Because this parameter specifies maximum expected clock difference between
+the hosts, it is also used during key rotation after HUP signal: after having
+received it, Nest allows both the new keys and the current keys to be 
+simultaneously valid for that number of seconds. This makes key rotation
+scheduled from cron to proceed without interruption even though Nest's on both
+sides receive their signals not at the same exact time.
+
+-M:
+network_mtu_in_bytes is a size of the MTU window on the external interface
+(the one VPN packets will go through). This parameter serves two purposes.
+First, VPN packets will never get bigger than that. This helps avoiding
+fragmenting VPN IP packets going out through the external interface, and is
+generally a good idea, because perimeter firewalls would never let fragmented
+IP through. Actually, VPN packets will NOT be of exactly that size, they will
+occasionaly be smaller. But what matters is that they never get bigger. Second,
+Nest adjusts MTU size on the tunneling device based on this value and its
+estimates on how much overhead a VPN packet could add. This insures than Nest
+always receives plain packets that fit in a VPN packet and therefore can be
+sent through the VPN.
+
+-------------------------------------------------------------------------------
+Usage:
+-------------------------------------------------------------------------------
+
+Installation samples:
+
+-------------------------------------------------------------------------------
+
+I. Normal (non-ICMP) mode.
+
+So, we need to connect two LANs with a VPN. Let's say the first LAN has IP
+addresses like 192.168.0.* and the other has 192.168.1.*. All the machines
+inside first LAN have their default gateway set to 192.168.0.1, and inside
+second LAN to 192.168.1.1. You need two machines, one inside each LAN to run
+Nest. These machines don't actually need to have real external IP addresses,
+they only need means to send packets to each other. They both can (and should)
+reside behind a firewall.
+
+So, our exemplary network layout is as follows:
+
+L  LAN machines:    nest0:          router0:        firewall0:
+A  192.168.0.x      192.168.0.N     192.168.0.1     17.7.7.71 ---+
+N  192.168.0.y                      17.7.7.72                    |
+0  192.168.0.z                      17.7.7.N                     W
+                                                                 A
+                                                                 N
+L  LAN machines:    nest1:          router1:        firewall1:   |
+A  192.168.1.x      192.168.1.N     192.168.1.1     18.8.8.81 ---+
+N  192.168.1.y                      18.8.8.82
+1  192.168.1.z                      18.8.8.N
+
+Note that both routers also perform as NATs. Also note that although both
+routers each had a static IP address (17.7.7.72 and 18.8.8.82), we have to
+add another one (17.7.7.N and 18.8.8.N) for the sake of NAT address
+redirection so that Nest machines are accessible from outside. This is
+effectively the same as having a static IP address on Nest machines
+themselves, but in this example let's do it this way.
+
+0. Add IP aliases on routers (all commands are expressed in simplified
+FreeBSD-like terms, exact commands depend on your hardware):
+
+router0> ifconfig if0 alias 17.7.7.N
+router1> ifconfig if0 alias 18.8.8.N
+
+Then we need to make certain changes in routing:
+
+1. Both routers must be set to direct packets that go from their subordinate
+LAN machines to other side's LAN machines to Nest:
+
+router0> route 192.168.1.* to 192.168.0.N
+router1> route 192.168.0.* to 192.168.1.N
+
+2. Both firewalls must allow VPN packets to go through in both directions:
+
+firewall0> allow ipip from 17.7.7.N to 18.8.8.N
+firewall0> allow ipip from 18.8.8.N to 17.7.7.N
+firewall1> allow ipip from 18.8.8.N to 17.7.7.N
+firewall1> allow ipip from 17.7.7.N to 18.8.8.N
+
+Note that ipip is an ip protocol with code 99, Nest tags VPN packets with ipip
+by default. You can override that with -p command-line switch.
+
+3. Both NATs must be set to redirect aliased IP address to the internal Nest
+address:
+
+router0> redirect address 17.7.7.N to 192.168.0.N
+router1> redirect address 18.8.8.N to 192.168.1.N
+
+4. Start Nest's (with all defaults):
+
+nest0> nest -s 10.0.0.1 -d 10.0.0.2 -r 192.168.0.N -g 18.8.8.N
+            -k /etc/nest/enc.key -K /etc/nest/auth.key -t /dev/tun0
+nest1> nest -s 10.0.0.2 -d 10.0.0.1 -r 192.168.1.N -g 17.7.7.N
+            -k /etc/nest/enc.key -K /etc/nest/auth.key -t /dev/tun0
+
+5. Both Nest machines must be set to direct packets that go to the other
+side's LAN machines to the Nest-driven tunnel:
+
+nest0> route 192.168.1.* to interface tun0
+nest1> route 192.168.0.* to interface tun0
+
+Ensure that Nest-running hosts perform as gateways (gateway_enable="YES") too.
+
+-------------------------------------------------------------------------------
+
+II. ICMP mode.
+
+The network layout is as follows (establishing VPN through a firewall with
+no administrative support whatsoever, unlike the first example):
+
+L  LAN machine:  Nest:        Firewall:                        External server:
+A  192.168.0.1   192.168.0.N  17.7.7.71 -------- WAN --------- 18.8.8.81
+N                                                              18.8.8.X
+
+What we have here is a LAN machine blocked behind a firewall, and the firewall
+lets internal machines ping outside servers. To do so it performs as a stateful
+packet filter. What is essential is that from 192.168.0.1 you can ping
+18.8.8.81. The external server sees pings as though they are incoming from
+the firewall:
+
+lan> ping 18.8.8.81                      ext> tcpdump -i if0 ip proto icmp
+...                                      ...
+Reply from 18.8.8.81, time=120ms         17.7.7.71 > 18.8.8.81: echo request
+                                         18.8.8.81 > 17.7.7.71: echo reply
+...
+
+Now, let's proceed to Nest installation. You need a separate machine to run
+Nest at. VMWare or similar emulator could work too but adjusting the routing
+is not obvious to say the least, so for the sake of simplicity I assume you
+have a separate machine at 192.168.0.N.
+
+1. Your best bet would be to add another IP address on external server just for
+you. You can still go without it, but it's simpler if you have your own IP
+there.
+
+ext> ifconfig if0 alias 18.8.8.X
+
+2. Run Nest on external server:
+
+ext> nest -s 10.0.0.1 -d 10.0.0.2 -r 18.8.8.X -g 17.7.7.71 -t /dev/tun0
+          -k /etc/nest/enc.key -K /etc/nest/auth.key -p 1 -e resp -D 40000
+          -q 32 -n 18.8.8.X
+ext> ipfw add divert icmp from 17.7.7.71 to 18.8.8.X in via if0 icmptype 8
+
+Note that we have to support Nest with kernel packet filter (ipfw). Also
+note that -n switch will masquerade the outgoing IP packets as if they
+originate from 18.8.8.X.
+
+3. On external server, forward all the incoming traffic for 18.8.8.X to the
+   tunnel:
+
+ext> ipfw add forward 10.0.0.2 ip from any to 18.8.8.X in via if0
+
+3. Run Nest on support LAN machine:
+
+nest> nest -s 10.0.0.2 -d 10.0.0.1 -r 192.168.0.N -g 18.8.8.X -t /dev/tun0
+           -k /etc/nest/enc.key -K /etc/nest/auth.key -p 1 -e req
+           -q 500 -N 192.168.0.1
+
+Note that this instance of Nest will exclusively direct all the incoming VPN
+traffic to the single machine, specified with -N switch.
+
+4. Forward all the incoming traffic from the LAN machine to the tunnel:
+
+nest> ipfw add forward 10.0.0.1 ip from 192.168.0.1 to any in via if0
+
+5. At the LAN machine, route all traffic to the Nest-running machine:
+
+lan> route add default 192.168.0.N
+
+Now as you done that, 18.8.8.X is essentially the same address as 192.168.0.1.
+For instance, if anyone in the world does
+
+evil> telnet 18.8.8.X
+
+this would be exactly the same as if she did
+
+evil> telnet 192.168.0.1
+
+while inside the LAN. This could be a huge security hole, so make sure you
+understand what you are doing. Another thing to mention is that LAN Nest will
+be endlessly pinging the external Nest, at least once in a -q specified time
+(twice a second in this example) therefore don't set -q too low and beware that
+your admin can always see something strange going on (at least she'd better
+do).
+
+-------------------------------------------------------------------------------
+
+Key management:
+
+The key to cryptography is (guess what) a key. Nest uses the very simplistic
+approach - both peer Nests must know the key beforehand by simply sharing the
+same key files.
+
+Practically, not having to deal with a dedicated NSA-grade attacker, I would
+simply generate a large random file once like this:
+
+# dd if=/dev/urandom of=key bs=64 count=7300
+
+You can do it on a disconnected or even one-time disposable machine. Also you
+can use other sources of randomness and combine them with openssl or something,
+but the outcome will be hardly less predictable.
+
+Then I would copy the key file to both hosts, protect it with 
+
+# chmod 400 key
+
+and for an uncompromised machine that should suffice. Then the following
+script scheduled to run on both hosts at the same time should complete the
+setup:
+
+#!/bin/sh
+TIMESTAMP=`date +%s`
+BLOCK=`dc -e "$TIMESTAMP 86400 / 3650 % 2 * p"`
+touch enc_key
+chmod 600 enc_key
+dd if=key of=enc_key bs=64 count=1 skip=$BLOCK
+touch auth_key
+chmod 600 auth_key
+dd if=key of=auth_key bs=64 count=1 skip=`dc -e "$BLOCK 1 + p"`
+kill -HUP /var/run/nest.pid
+
+Then the keys will be rotated daily, be random and never repeat for 10 years.
+
+-------------------------------------------------------------------------------
+
+Clock synchronization:
+
+As described above, clock synchronization is one of the two things that Nest
+uses to prevent packet replays. You can turn it off by specifying -y 0, but
+in this case you must NEVER shut the Nest down, otherwise ALL the previous
+packets become replayable. I don't think this is a better option than spending
+some efforts synchronizing the clocks. Also, the "Key management" section
+describes how having a loose agreement on time helps improving keying.
+
+First, clocks need not to be synchronized precisely. The tolerance treshold
+is set by -y command line parameter and I believe that reasonable value for it
+is about a minute.
+
+Second, not only you must synchronize the clocks, but you must KEEP them
+synchronized, which is much more difficult. I can see several options here:
+
+1. Have clocks synchronized once by hand, then keep an eye on the time drift
+and adjust them manually if needed. Make it a part of routine maintenance.
+A pair of good old grandma's cuckoo clocks or other trustworthy time sources
+helps a lot.
+
+2. Have an automated procedure that periodically synchronizes clocks with
+some external (WAN-based) source, ex. NTP time servers. This reduces the
+administrative hassle but brings in a great deal of insecurity, as in
+"never trust anything that is out of your control".
+
+3. Have a pair of very reliable time sources inside each LAN. Cesium or radio
+UTC time sources may be good (I've never touched any of those), but if you
+are dedicated enough to have those in place, will you be considering
+installing Nest ?
+
+4. Have an NTP server running inside one LAN, then have the other LAN keeping
+in sync with that server by simply running NTP-over-VPN. This may sound like
+a good idea, especially if you have more than 2 LANs connected, but it's
+vulnerable in that the attacker can simply make a guess and drop packets that
+she thinks carry the encrypted NTP. In this case no synchronization ever
+occurs and as the drift progresses, VPN fails completely.
+
+In practice hardly anyone bothers for anything but option 2, but option 4
+is almost as practical and yet more secure.
+
+One final note: always adjust the time forward, never backward. If you do
+adjust the time on Nest running machine backwards, the other side will treat
+the consequent packets as being replayed until the time ticks back to the last
+recorded. If you absolutely need to do so, send HUP signal to the Nest on
+the *other* side after you adjust time backward on *this* side.
+
+-------------------------------------------------------------------------------
+Performance hints and tests
+-------------------------------------------------------------------------------
+
+Speed & latency of the VPN link depend heavily on the command-line settings and
+the nature of the traffic. It also makes a huge difference whether you use
+normal non-icmp or icmp sending mode.
+
+First some common hints:
+
+Always use maximum compression (-z 9) unless you are severely limited with
+the CPU power on the Nest running machines. Much of the traffic that Nest is
+transferring is not compressible, because it's already compressed on
+application level, but you have nothing to lose except for otherwise wasted CPU
+cycles.
+
+VPN packet adds inavoidable overhead to the packets it wraps. If you are lucky,
+compression will compensate for that and one or more LAN packet will fit in a
+single VPN packet. But if the LAN traffic consists of a steady flow of
+incompressible maxed out IP packets, there is no way single such packet could
+fit in a single VPN packet. Nest adjusts MTU on the tunneling device so that
+even in the worst case the packet it receives from the LAN can always be
+squeezed in a VPN packet. This means that the otherwise too large packet is
+fragmented inside the kernel and is transferred as several separate fragments.
+Therefore expect a significant percentage of LAN traffic that comes out of
+Nests on each side to be fragmented. If your WAN link has low quality (high
+packet loss rate etc.), incomplete packets for which not all fragments have
+been received will accumulate in the LAN machines' IP stacks. I have seen
+Windows 2003 Server machine completely stopping to accept any more fragmented
+packets when it becomes flooded like that (FreeBSD machine copes fine under the
+same circumstances), so take care.
+
+Make sure your Nest boxes are tuned up as appropriate for network servers, with
+mbufs and everything.
+
+1. Normal mode.
+
+This is the better option if you can make non-ICMP IP traffic flow between
+the two Nest running hosts. Always use it if you can.
+
+Only use queueing if your VPN is always loaded up high. If there is no steady
+flow of packets to keep the queue full all of the time, use -q 0, otherwise you
+just add to the latency, getting nothing in return.
+
+2. ICMP mode.
+
+Use this mode only if the normal mode is inavailable. For me it was the way to
+make VPN tunnel through a firewall. If there was no firewall, I'd have used the
+normal mode.
+
+In ICMP mode, the VPN is no longer symmetrical. The side that uses ICMP echo
+requests (the one behind a firewall) can send at will, just as with the normal
+mode. But the other side can't send anything unless it has other side's
+requests to respond to. To bypass a stateful packet filter, Nest has to keep
+a pool of requests and respond to each request once whenever necesary. I'll
+refer to the sides as "req" and "resp". The req side must provide the resp
+side with requests no matter if either have anything to send. The req side will
+fire a request at least once in a -q specified time, no matter if it has
+anything to send, call this polling if you will. This obviously adds to the
+overall VPN overhead.
+
+If the resp side is flooded with packets, and still has not enough requests,
+it will start dropping packets off the queue, leading to obvious service
+degradation. Nest uses a simple feedback scheme where resp side notifies the
+req side that it ran out of requests and upon such a notification the req side
+immediately fires back a request. This helps a lot to improve, but is still not
+a 100% guarantee. Expect packet loss.
+
+Performance tests:
+
+I have run performance tests in the following configuration: two identical
+machines (Celeron 300, 256M RAM) running FreeBSD 4.8 linked with direct 10MBit
+Ethernet "WAN" segment. Each machine also has 100MBit link to its own "LAN".
+
+LAN1 <-100MBit-> NEST1 <-10MBit-> NEST2 <-100MBit-> LAN2
+
+The 10MBit "WAN" segment is tweaked down with dummynet on both sides so that it
+has average throughput of 1.5MBit, round-trip time of average 100ms, packet
+loss rate of 1% and packets can arrive out of order. Here is a sample ping to
+show the quality of the "WAN" link:
+
+nest1> ping -c 5000 -i 0.01 -s 1472 nest2
+...
+5000 packets transmitted, 4885 packets received, 2% packet loss
+round-trip min/avg/max/stddev = 4.241/122.594/363.877/71.613 ms
+
+Nest config 1 (fastest):
+Both nests are run in normal mode with -p 99 -q 0 -z 9
+
+Nest config 2 (queued):
+Both nests are run in normal mode with -p 99 -q 32 -z 9
+Note that all the tests keep the queue loaded up high all the time to justify
+queueing.
+
+Nest config 3 (pinged):
+Nest 1 is run with -p 1 -e req -q 250 -z 9
+Nest 2 is run with -p 1 -e resp -q 32 -z 9
+
+Test 1 (throughput):
+Each LAN machine establishes 6 FTP sessions to the other side LAN machine. Each
+session transfers a single 10M file. Out of the six sessions, three transfer
+the same uncompressible file, and the other three - the same compressible file
+(can be compressed to 50%). Therefore total raw transferred data amount is 120M
+(60M in each direction).
+
+  Config 1:
+  All transfers finish evenly in 6.5 minutes (380 seconds) on average. Each
+  transfer reports average throughput of 26KBytes/s, all sum up to 312KBytes/s.
+  LAN transfers 200K packets, 132M. WAN transfers 200K packets, 120M.
+
+  Config 2:
+  All transfers finish evenly in 8 minutes (450 seconds) on average. Each
+  transfer reports average throughput of 22KBytes/s, all sum up to 265KBytes/s.
+  LAN transfers 200K packets, 134M. WAN transfers 108K packets, 114M.
+
+  Config 3:
+  Transfers that flow along with requests (resp side downloading from req side)
+  finish evenly in 7 minutes (420 seconds) on average. Each transfer reports
+  average throughput of 24 KBytes/s, all sum up to 146KBytes/s.
+  Transfers that flow along with responses (req side downloading from resp
+  side) finish more or less evenly in 15 minutes (940 seconds) on average. Each
+  transfer reports average throughput of 10KBytes/s, all sum up to 60KBytes/s.
+  LAN transfers 192K packets, 133M, WAN transfers 116K packets, 115M. The resp
+  Nest reports that it dropped 830 packets due to lack of requests.
+
+Test 2 (latency):
+Each LAN machine runs 6 FTP spiders that each have to fetch from the other side
+a single directory containing 1000 empty files. Spiders run in passive mode.
+
+  Config 1:
+  All transfers finish evenly in 9 minutes (560 seconds) on average. Each file
+  takes 46ms on average.
+  LAN transfers 170K packets, 22M. WAN transfers 170K packets, 11M.
+
+  Config 2:
+  All transfers finish evenly in 10 minutes (620 seconds) on average. Each file
+  takes 51ms on average.
+  LAN transfers 168K packets, 11M. WAN transfers 20K packets, 10M.
+
+  Config 3:
+  All transfers finish evenly in 12 minutes (750 seconds) on average. Each file
+  takes 62ms on average.
+  LAN transfers 169K packets, 11M. WAN transfers 20K packets, 10M.
+
+-------------------------------------------------------------------------------
+Packet level schema
+-------------------------------------------------------------------------------
+
+Nest is a two-way tunnel. It receives packets from inside the LAN, encrypts
+them and sends to the peer over the WAN so that the peer can decrypt them
+and inject inside the other side's LAN.
+
+Here is a step-by-step example of the whole process:
+
+1. Packet A is received from inside the LAN and is being queued:
+[AAAAAAA]
+2. Packet B is received from inside the LAN and is being queued:
+[AAAAAAA][BBBBBBBBBB]
+3. Packet C is received from inside the LAN and Nest flushes the queue:
+[AAAAAAA][BBBBBBBBBB][CCCC]
+4. Queued packets are being compressed in a single bigger packet:
+[AABABBABBBCBCC]
+5. Nest attaches a header and three tailers to the packet:
+[hmac|x|y|3][AABABBABBBCBCC][A:7][B:10][C:4]
+6. Nest encrypts the whole thing:
+12ac12a8faa0416c5783109e0d7d81fa48c2fd273926
+
+7. Nest sends the packet to the peer.
+
+...
+WAN sees encrypted packet
+12ac12a8faa0416c5783109e0d7d81fa48c2fd273926
+...
+
+8. The peer Nest receives the packet:
+12ac12a8faa0416c5783109e0d7d81fa48c2fd273926
+9. Nest decrypts the packet:
+[hmac|x|y|3][AABABBABBBCBCC][A:7][B:10][C:4]
+10. Nest checks the hmac to see if the packet is valid and x|y pair to see
+if the packet is being replayed.
+11. Nest decompresses the packet payload:
+[AAAAAAA][BBBBBBBBBB][CCCC]
+12. Nest runs through the 3 packet tailers and sends a packet
+described by each into the LAN:
+[AAAAAAA]
+[BBBBBBBBBB]
+[CCCC]
+
+-------------------------------------------------------------------------------
+Copyright:
+-------------------------------------------------------------------------------
+
+(c) 2001-2017 Dmitry Dvoinikov, crypto portions (c) 1995-1998 Eric Young
+See LICENSE for more information
+
+-------------------------------------------------------------------------------
